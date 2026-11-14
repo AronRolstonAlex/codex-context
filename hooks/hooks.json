@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/session_report.py\"",
+            "statusMessage": "Codex 上下文洞察：准备报告"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/session_report.py\"",
+            "statusMessage": "Codex 上下文洞察：更新报告"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/session_report.py\"",
+            "statusMessage": "Codex 上下文洞察：记录压缩前用量"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/session_report.py\"",
+            "statusMessage": "Codex 上下文洞察：收尾更新报告"
+          }
+        ]
+      }
+    ]
+  }
+}
