@@ -35,6 +35,7 @@ MARKETPLACE_NAME = "local-personal"
 # Everything that ships. Anything not listed here stays out of the install.
 PAYLOAD = [
     "plugin.json",
+    "mcp.json",
     "assets",
     "hooks",
     "scripts",
@@ -65,7 +66,8 @@ def _ignore_python_cache(directory: str, names: list[str]) -> set[str]:
 
 def copy_payload(src: Path, dest: Path, *, dry_run: bool) -> list[Path]:
     written: list[Path] = []
-    dest.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
     for entry in PAYLOAD:
         source = src / entry
         if not source.exists():
@@ -83,7 +85,7 @@ def copy_payload(src: Path, dest: Path, *, dry_run: bool) -> list[Path]:
     return written
 
 
-def read_marketplace(path: Path) -> dict:
+def read_marketplace(path: Path, *, dry_run: bool = False) -> dict:
     if not path.is_file():
         return {
             "name": MARKETPLACE_NAME,
@@ -101,10 +103,11 @@ def read_marketplace(path: Path) -> dict:
             data["plugins"] = []
         return data
     except (json.JSONDecodeError, ValueError, OSError) as exc:
-        print(f"  ! 现有 marketplace.json 无法解析（{exc}），将备份后重建", file=sys.stderr)
-        backup = path.with_suffix(".json.bak-codex-context")
-        shutil.copy2(path, backup)
-        print(f"    备份: {backup}", file=sys.stderr)
+        print(f"  ! 现有 marketplace.json 无法解析（{exc}）", file=sys.stderr)
+        if not dry_run:
+            backup = path.with_suffix(".json.bak-codex-context")
+            shutil.copy2(path, backup)
+            print(f"    备份: {backup}", file=sys.stderr)
         return {
             "name": MARKETPLACE_NAME,
             "interface": {"displayName": "本机插件"},
@@ -140,7 +143,7 @@ def install(codex_home: Path, *, dry_run: bool) -> int:
     written = copy_payload(src, target, dry_run=dry_run)
     print(f" 复制 {len(written)} 项")
 
-    data = read_marketplace(market)
+    data = read_marketplace(market, dry_run=dry_run)
     upsert_marketplace_entry(data, target)
     if not dry_run:
         market.parent.mkdir(parents=True, exist_ok=True)
@@ -176,7 +179,7 @@ def uninstall(codex_home: Path, *, dry_run: bool) -> int:
         print(f"插件目录不存在: {target}")
 
     if market.is_file():
-        data = read_marketplace(market)
+        data = read_marketplace(market, dry_run=dry_run)
         before = len(data["plugins"])
         data["plugins"] = [p for p in data["plugins"] if p.get("name") != PLUGIN_NAME]
         if len(data["plugins"]) != before:

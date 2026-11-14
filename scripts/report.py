@@ -16,8 +16,8 @@ Codex writes itself:
 Charts are hand-drawn inline SVG: no JavaScript, no CDN, no network. The file
 opens offline and prints correctly.
 
-Metadata only. Prompt text, answers, tool arguments and tool output are never
-read out of the rollout files (see context_core.py).
+Metadata only by default. Detailed local reports require a fresh, explicit
+human confirmation for each run (see context_core.py).
 
 Some dsh-context widgets cannot be rebuilt here, because Codex does not record
 the underlying figures. Those are named explicitly in ``DATA_GAPS`` and shown
@@ -35,7 +35,9 @@ import argparse
 import html
 import json
 import math
+import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,9 +56,11 @@ AUTHOR = "凪梦尘"
 
 # Figures dsh-context shows that Codex does not record. Stated, not faked.
 DATA_GAPS = [
-    "系统提示词 / 工具定义 / 注入上下文的分别占比：Codex 的 rollout 只记录合计输入，不拆分类别。",
-    "首 token 时间（TTFB）：rollout 记录的是每个事件的完成时刻，看不到流式首包。",
-    "命令执行明细（命令行文本）：插件只保留程序名计数，不读参数以保护隐私。",
+    "分类上下文 token：此报告无法可靠还原每次请求的完整系统提示、工具定义及各分类占比。",
+    "首 token 时间仅在轮次事件提供 time_to_first_token_ms 时显示，缺失表示未知。",
+    "记录浏览器展示保存的条目，并非每次请求真实发送的完整上下文。",
+    "协作关系和状态只基于已记录事件，不代表实时状态或完整 Agent 家族。",
+    "历史可能包含父会话复制的内容或缺失片段，跨会话总计可能重复。",
 ]
 
 CSS = """
@@ -114,6 +118,11 @@ tbody tr:last-child td{border-bottom:0}
 .statline{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:13.5px}
 .statline:last-child{border-bottom:0}
 .statline span:last-child{font-variant-numeric:tabular-nums;font-weight:500}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+input,select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px;max-width:100%}
+pre{white-space:pre-wrap;word-break:break-word;max-height:24rem;overflow:auto}
+details{border-top:1px solid var(--line);padding:9px 0}summary{cursor:pointer} .table-scroll{overflow-x:auto}
+.warning{border:1px solid var(--warn);background:#30261c;border-radius:8px;padding:12px;margin:12px 0}
 """
 
 LEVEL_GOOD = "var(--accent2)"
@@ -150,6 +159,10 @@ def human_int(value: float | int | None) -> str:
     return f"{n:.0f}"
 
 
+def signed_int(value: int | None) -> str:
+    return f"{value:+,}" if value is not None else "—"
+
+
 def human_usd(value: float | None) -> str:
     if value is None:
         return "—"
@@ -176,7 +189,10 @@ def human_duration(seconds: float | None) -> str:
 def fmt_time(ts: float | None) -> str:
     if ts is None:
         return "—"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OverflowError, OSError):
+        return "—"
 
 
 def level_color(ratio: float) -> str:
@@ -423,7 +439,7 @@ def svg_ratio_bar(ratio: float | None) -> str:
 # --------------------------------------------------------------------------
 
 
-def build_payload(agg: Aggregate, home: Path) -> dict:
+def build_payload(agg: Aggregate, home: Path, *, detailed: bool = False) -> dict:
     totals = agg.totals
     sessions_payload = []
     for s in agg.sessions:
@@ -436,7 +452,7 @@ def build_payload(agg: Aggregate, home: Path) -> dict:
                 "started_text": fmt_time(s.started_at),
                 "ended_text": fmt_time(s.ended_at),
                 "duration_seconds": s.duration_seconds,
-                "cwd": s.cwd,
+                "cwd": s.cwd if detailed else None,
                 "model": s.primary_model,
                 "models": s.models,
                 "effort": s.effort,
@@ -446,19 +462,22 @@ def build_payload(agg: Aggregate, home: Path) -> dict:
                 "compactions": s.compaction_count,
                 "requests": len(s.snapshots),
                 "tokens": s.totals,
-                "cost_usd": s.cost(),
+                "cost_usd": s.cost() if s.snapshots or s.deltas else None,
                 "context_window": s.context_window,
                 "peak_context": s.peak_context,
                 "min_context": s.min_context,
-                "current_context": latest.context_used if latest else None,
+                "current_context": (latest.context_size or None) if latest else None,
                 "current_usage_ratio": latest.usage_ratio if latest else None,
                 "tools": s.tool_histogram(),
                 "items": s.items.as_dict(),
                 "context_series": [
                     {"t": t, "used": used, "window": window} for t, used, window in series
                 ],
+                "context_changes": s.context_changes(),
                 "unknown_lines": s.unknown_lines,
-                "path": str(s.path),
+                "path": str(s.path) if detailed else "",
+                "usage_available": bool(s.snapshots or s.deltas),
+                **({"details": s.details} if detailed and s.details is not None else {}),
             }
         )
 
@@ -471,11 +490,12 @@ def build_payload(agg: Aggregate, home: Path) -> dict:
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "codex_home": str(home),
+        "codex_home": str(home) if detailed else "(路径已隐藏)",
         "session_count": agg.session_count,
+        "usage_available": any(s.snapshots or s.deltas for s in agg.sessions),
         "totals": totals,
         "composition": totals_comp,
-        "cost_usd": agg.cost,
+        "cost_usd": agg.cost if any(s.snapshots or s.deltas for s in agg.sessions) else None,
         "unpriced_sessions": agg.unpriced_sessions,
         "cache_hit_rate": agg.cache_hit_rate,
         "models": agg.models(),
@@ -487,11 +507,13 @@ def build_payload(agg: Aggregate, home: Path) -> dict:
         "timing": {
             "turn_total": agg.turn_time_total,
             "tool_total": agg.tool_time_total,
-            "model_vs_tool": agg.model_vs_tool(),
+            "model_vs_tool": agg.model_vs_tool(),  # legacy estimate, not measured; retained for compatibility
+            "model_vs_tool_note": "兼容字段：简单相减的粗略估算，不适用于并发或缺失数据。请勿视为实测模型耗时。",
             "avg_turn": agg.avg_turn_seconds,
             "avg_tool": agg.avg_tool_seconds,
             "timed_turns": agg.timed_turns,
             "timed_tools": agg.timed_tools,
+            "first_token_ms": [t.time_to_first_token_ms for s in agg.sessions for t in s.timing.turns if t.time_to_first_token_ms is not None],
             "by_tool": agg.tool_timing(),
             "slowest": [
                 {
@@ -507,7 +529,7 @@ def build_payload(agg: Aggregate, home: Path) -> dict:
         "compactions_total": agg.compactions_total,
         "duration_total": agg.duration_total,
         "sessions": sessions_payload,
-        "privacy": "metadata_only",
+        "privacy": "detailed" if detailed else "metadata_only",
         "data_gaps": DATA_GAPS,
     }
 
@@ -522,16 +544,16 @@ def _kpis(payload: dict) -> str:
     cache = payload["cache_hit_rate"]
     cards = [
         ("会话数", str(payload["session_count"]), f"{payload['turns_total']} 轮"),
-        ("计费 Token", human_int(totals["total"]),
+        ("计费 Token", human_int(totals["total"]) if payload["usage_available"] else "—",
          f"输入 {human_int(totals['input'])} / 输出 {human_int(totals['output'])}"),
         ("预估成本", human_usd(payload["cost_usd"]),
          "部分模型未计价" if payload["unpriced_sessions"] else "全部模型已计价"),
         ("缓存命中", f"{cache * 100:.1f}%" if cache is not None else "—",
          f"命中 {human_int(totals['cached'])}"),
-        ("推理 Token", human_int(totals["reasoning"]),
+        ("推理 Token", human_int(totals["reasoning"]) if payload["usage_available"] else "—",
          f"占总输出 {totals['reasoning'] / max(1, totals['output']) * 100:.0f}%"),
         ("工具调用", str(payload["tool_calls_total"]), f"{len(payload['tools'])} 种工具"),
-        ("上下文压缩", str(payload["compactions_total"]), "窗口触顶后的自动压缩次数"),
+        ("上下文压缩", str(payload["compactions_total"]), "已识别的保守下限，可能不完整"),
         ("平均每轮", human_duration(payload["timing"]["avg_turn"]),
          f"共 {human_duration(payload['timing']['turn_total'])}"),
     ]
@@ -552,6 +574,8 @@ def _composition_card(payload: dict) -> str:
     """
     comp = payload["composition"]
     totals = payload["totals"]
+    if not payload["usage_available"]:
+        return '<div class="card"><h2>Token 构成</h2><div class="empty">没有可用的 token 记录。</div></div>'
     total = sum(comp.values()) or 1
 
     segments = [(COMPOSITION_LABELS[k], comp[k], COMPOSITION_COLORS[k]) for k in comp]
@@ -625,8 +649,8 @@ def _pressure_card(payload: dict) -> str:
         else ""
     )
     note = (
-        "按每个会话最后一次请求的窗口占用率分档。"
-        "≥90% 意味着下一次请求很可能触发自动压缩。"
+        "按每个会话最后一次有记录的请求读数分档，输入量回退为近似；不代表实时窗口。"
+        "压缩时机由 Codex 和模型决定。"
     )
     return (
         '<div class="card"><h2>上下文压力</h2>'
@@ -691,8 +715,6 @@ def _timing_card(payload: dict) -> str:
     turn_total = timing["turn_total"]
     tool_total = timing["tool_total"]
     split = timing["model_vs_tool"]
-    model = split["model"]
-    tools = split["tools"]
 
     if turn_total <= 0 and tool_total <= 0:
         return (
@@ -739,8 +761,8 @@ def _timing_card(payload: dict) -> str:
     )
 
     stats = [
-        ("轮次总耗时", human_duration(turn_total), f"{timing['timed_turns']} 轮可计时"),
-        ("工具总耗时", human_duration(tool_total), f"{timing['timed_tools']} 次可计时"),
+        ("轮次耗时之和", human_duration(turn_total if timing['timed_turns'] else None), f"{timing['timed_turns']} 轮可计时"),
+        ("工具耗时之和", human_duration(tool_total if timing['timed_tools'] else None), f"{timing['timed_tools']} 次可计时；可重叠"),
         ("平均每轮", human_duration(timing["avg_turn"]), "含模型与工具"),
         ("平均每工具", human_duration(timing["avg_tool"]), "单次执行"),
     ]
@@ -751,14 +773,15 @@ def _timing_card(payload: dict) -> str:
         for label, value, note in stats
     )
 
+    first = timing['first_token_ms']
+    first_note = f"首 token 平均 {sum(first) / len(first):.0f}ms（{len(first)} 轮有记录）" if first else "首 token 耗时：未知"
     note = (
-        "轮次耗时为 task_started → task_complete 的墙钟时间；"
-        "工具耗时为调用行到结果行。两者相减即模型自身的工作时间（思考、生成、传输）。"
+        "轮次耗时为单轮墙钟时间；工具耗时为调用到配对结果的时间，各次可以并发重叠。"
+        "工具耗时之和不能从轮次总耗时相减得出模型耗时；无可靠拆分时不显示。" + first_note
     )
 
     return (
         '<div class="card"><h2>耗时统计</h2>'
-        f"{svg_time_stack(model, tools)}"
         f"{stat_rows}"
         f'<p class="muted" style="font-size:11.5px;margin:12px 0 0">{esc(note)}</p>'
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px">'
@@ -766,6 +789,97 @@ def _timing_card(payload: dict) -> str:
         f'<div><h2 style="margin-bottom:8px">最慢轮次</h2>{slowest_table}</div>'
         "</div></div>"
     )
+
+
+def _detail_panel(payload: dict) -> str:
+    """Render only bounded, pre-collected details; all data is escaped text."""
+    if payload["privacy"] != "detailed":
+        return ''
+    groups: dict[str, list[str]] = {"records": [], "events": [], "files": [], "commands": [], "fleet": []}
+    notes = []
+    file_counts: dict[tuple[str, str], int] = {}
+    program_counts: dict[str, int] = {}
+    observed_commands = observed_failed = observed_slow = observed_messages = 0
+    for session in payload['sessions']:
+        detail = session.get('details') or {}
+        sid = str(session.get('session_id') or '未知')[:12]
+        if detail.get('truncated'):
+            notes.append(f"会话 {sid} 的部分条目达到上限，已截断")
+        parent = detail.get('parent_thread_id')
+        if parent:
+            groups['fleet'].append(f'<div class="filter-row" data-tags="关系"><b>{esc(sid)}</b> 的记录父线程：{esc(parent)}</div>')
+        for row in detail.get('records', []):
+            title = f"{sid} · {fmt_time(row.get('time'))} · {row.get('kind', '记录')} · 轮次 {row.get('turn', 0)}"
+            groups['records'].append(f'<details class="filter-row" data-tags="{esc(row.get("kind", ""))}"><summary>{esc(title)}</summary><pre>{esc(row.get("content", ""))}</pre></details>')
+        for row in detail.get('events', []):
+            groups['events'].append(f'<div class="filter-row" data-tags="压缩">{esc(sid)} · {esc(fmt_time(row.get("time")))} · {esc(row.get("kind"))}</div>')
+        for row in detail.get('files', []):
+            tags = {'read': '读取', 'write': '写入', 'search': '搜索', 'image': '图片'}.get(row.get('kind'), '未知')
+            key = (tags, str(row.get('path') or '未知'))
+            file_counts[key] = file_counts.get(key, 0) + 1
+            groups['files'].append(f'<div class="filter-row" data-tags="{tags}"><b>{tags}</b> · {esc(sid)} · {esc(fmt_time(row.get("time")))} · <span class="mono">{esc(row.get("path"))}</span> <span class="muted">{esc(row.get("source"))}</span></div>')
+        for row in detail.get('commands', []):
+            observed_commands += 1
+            program = row.get('program')
+            if program:
+                program_counts[program] = program_counts.get(program, 0) + 1
+            status = str(row.get('status') or '未知')
+            code = row.get('exit_code')
+            duration = row.get('duration')
+            tags = []
+            if status.lower() == 'failed' or (isinstance(code, int) and code != 0):
+                tags.append('失败')
+                observed_failed += 1
+            if isinstance(duration, (int, float)) and duration >= 10:
+                tags.append('慢')
+                observed_slow += 1
+            if status.lower() in ('in_progress', 'inprogress'):
+                tags.append('后台')
+            title = f"{sid} · {fmt_time(row.get('time'))} · {status} · 退出码 {code if code is not None else '未知'} · {human_duration(duration)}"
+            body = f"命令：\n{row.get('command', '')}\n\n输出（可能已截断）：\n{row.get('output', '')}"
+            groups['commands'].append(f'<details class="filter-row" data-tags="{esc(" ".join(tags))}"><summary>{esc(title)}</summary><pre>{esc(body)}</pre></details>')
+        for row in detail.get('collaboration', []):
+            if row.get('kind') == 'message':
+                observed_messages += 1
+            title = f"{sid} · {fmt_time(row.get('time'))} · {row.get('kind', '事件')} · {row.get('status', '未知')}"
+            body = f"发送方：{row.get('sender', '')}\n接收方：{row.get('recipients', '')}\n\n{row.get('content', '')}"
+            groups['fleet'].append(f'<details class="filter-row" data-tags="事件"><summary>{esc(title)}</summary><pre>{esc(body)}</pre></details>')
+
+    def panel(key: str, title: str, choices: list[str], note: str) -> str:
+        options = ''.join(f'<option value="{esc(choice)}">{esc(choice)}</option>' for choice in choices)
+        rows = ''.join(groups[key]) or '<div class="empty">没有可用记录；不代表没有发生。</div>'
+        return (f'<section class="card" id="{key}"><h2>{esc(title)}</h2><p class="muted">{esc(note)}</p>'
+                f'<div class="controls"><label>筛选 <select data-filter="{key}"><option value="">全部</option>{options}</select></label>'
+                f'<label>搜索 <input type="search" data-search="{key}" placeholder="在已加载的记录中搜索"></label></div>'
+                f'<div class="rows">{rows}</div></section>')
+    file_summary = '；'.join(f'{kind} {path} ×{count}' for (kind, path), count in sorted(file_counts.items(), key=lambda item: -item[1])[:20]) or '没有可汇总的路径'
+    program_summary = '；'.join(f'{name} ×{count}' for name, count in sorted(program_counts.items(), key=lambda item: -item[1])[:12]) or '程序分布未知'
+    warning = '<div class="warning">更详细分析：此报告可能包含提示词、回答、命令、输出、文件路径及协作消息中的敏感数据。请仅保存在私密位置，不要随意分享。</div>'
+    if notes:
+        warning += '<p class="warning">' + esc('；'.join(notes)) + '</p>'
+    return (warning
+        + panel('records', '记录浏览器', ['user', 'assistant', '工具调用', '工具结果'], '展示已保存条目，不是任一请求完整上下文；历史可能包含继承内容。')
+        + panel('events', '上下文事件', ['压缩'], '仅列可识别的压缩记录；不同记录可能描述同一次操作，不能直接当作去重次数。')
+        + panel('files', '文件活动', ['读取', '写入', '搜索', '图片'], '来自结构化命令解析、文件变更及图片条目；不是完整文件审计，调用不等于成功。路径频次（最多 20 项）：' + file_summary)
+        + panel('commands', '命令执行', ['失败', '慢', '后台'], f'已记录 {observed_commands} 条，已知失败 {observed_failed} 条，已知慢 {observed_slow} 条；程序：{program_summary}。旧格式状态未知，慢指有时长且不少于 10 秒；后台仅显示明确记录为运行中的条目。')
+        + panel('fleet', '编队 · 已记录的协作', ['关系', '事件'], f'已记录消息 {observed_messages} 条；来自父线程字段、协作条目和 Agent 间消息，仅为历史观察，不推断实时运行状态。'))
+
+
+_DETAIL_SCRIPT = """<script>
+(function(){
+  function update(id){
+    const panel=document.getElementById(id); if(!panel)return;
+    const filter=panel.querySelector('[data-filter]').value;
+    const text=panel.querySelector('[data-search]').value.toLocaleLowerCase();
+    panel.querySelectorAll('.filter-row').forEach(function(row){
+      row.hidden=Boolean((filter && !(row.dataset.tags||'').includes(filter)) || (text && !row.textContent.toLocaleLowerCase().includes(text)));
+    });
+  }
+  document.querySelectorAll('[data-filter],[data-search]').forEach(function(el){
+    el.addEventListener(el.matches('select')?'change':'input', function(){update(el.dataset.filter||el.dataset.search)});
+  });
+})();
+</script>"""
 
 
 def render_html(payload: dict) -> str:
@@ -780,6 +894,7 @@ def render_html(payload: dict) -> str:
         return (
             "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:\">"
             "<title>Codex 上下文洞察</title>"
             f"<style>{CSS}</style></head><body><div class='wrap'>"
             "<h1>Codex 上下文洞察</h1>"
@@ -800,6 +915,16 @@ def render_html(payload: dict) -> str:
             (p["t"], p["used"], p["window"]) for p in busiest["context_series"]
         ]
         trend_title = f"上下文趋势 · {str(busiest['session_id'] or '')[:8]}"
+    changes = busiest.get('context_changes', []) if busiest else []
+    change_rows = ''.join(
+        f'<tr><td>{index}</td><td>{esc(fmt_time(row["timestamp"]))}</td>'
+        f'<td class="num">{human_int(row["used"])}</td>'
+        f'<td class="num">{esc(signed_int(row["change"]))}</td></tr>'
+        for index, row in enumerate(changes[-500:], max(1, len(changes) - 499))
+    )
+    changes_table = ('<details><summary>逐请求全量与变化（最近 500 条）</summary><div class="table-scroll"><table>'
+                     '<thead><tr><th>序号</th><th>时间</th><th>记录/近似值</th><th>与上一记录差值</th></tr></thead>'
+                     f'<tbody>{change_rows}</tbody></table></div></details>') if change_rows else ''
 
     models = payload["models"]
     total_model_turns = sum(models.values()) or 1
@@ -841,7 +966,7 @@ def render_html(payload: dict) -> str:
     for row in payload["sessions"]:
         window = row["context_window"]
         peak = row["peak_context"]
-        label = row["session_id"] or Path(row["path"]).name
+        label = row["session_id"] or (Path(row["path"]).name if row["path"] else "未知")
         session_rows.append(
             "<tr>"
             f'<td class="mono">{esc(label[:8])}</td>'
@@ -850,7 +975,7 @@ def render_html(payload: dict) -> str:
             f'<td class="mono muted">{esc(short_path(row["cwd"]))}</td>'
             f'<td class="num">{row["turns"]}</td>'
             f'<td class="num">{row["requests"]}</td>'
-            f'<td class="num">{human_int(row["tokens"]["total"])}</td>'
+            f'<td class="num">{human_int(row["tokens"]["total"]) if row["usage_available"] else "—"}</td>'
             f'<td class="num">{human_usd(row["cost_usd"])}</td>'
             f'<td class="num">{human_int(peak) if peak else "—"}'
             f'<span class="muted"> / {human_int(window) if window else "—"}</span></td>'
@@ -887,11 +1012,12 @@ def render_html(payload: dict) -> str:
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
 <title>Codex 上下文洞察</title>
 <style>{CSS}</style></head>
 <body><div class="wrap">
 <h1>Codex 上下文洞察</h1>
-<div class="sub">生成于 {esc(payload['generated_at'])} · 数据源 <span class="mono">{esc(payload['codex_home'])}/sessions</span> · 仅元数据 · 作者 {esc(AUTHOR)}</div>
+<div class="sub">生成于 {esc(payload['generated_at'])} · 数据源 <span class="mono">{esc(payload['codex_home'])}</span> · {('更详细分析' if payload['privacy'] == 'detailed' else '仅元数据')} · 作者 {esc(AUTHOR)}</div>
 
 <div class="kpis">{_kpis(payload)}</div>
 
@@ -904,9 +1030,10 @@ def render_html(payload: dict) -> str:
   <h2>{esc(trend_title)}</h2>
   {svg_line_chart(trend_series)}
   <div class="legend">
-    <span><i style="background:var(--accent)"></i>每次请求后的上下文占用</span>
-    <span><i style="background:var(--warn)"></i>模型上下文窗口上限</span>
+    <span><i style="background:var(--accent)"></i>每次有记录的请求值（可能由输入量近似）</span>
+    <span><i style="background:var(--warn)"></i>模型上下文窗口上限（可能为内置回退）</span>
   </div>
+  {changes_table}
 </section>
 
 {_timing_card(payload)}
@@ -928,14 +1055,15 @@ def render_html(payload: dict) -> str:
   {unknown_note}
 </section>
 
+{_detail_panel(payload)}
 <div class="foot">
 <p style="margin:0 0 10px">作者：<strong>{esc(AUTHOR)}</strong></p>
-本报告只读取 Codex 写入的会话元数据（token 数、模型名、工具名、时间戳），
-不读取提示词正文、模型回答、工具参数或工具输出。成本为按公开单价的估算，不等同账单。
-<p style="margin-bottom:4px"><strong>本报告无法覆盖的部分</strong>（Codex 未记录这些数字，宁可留空也不编造）：</p>
+{('更详细分析已获本次授权，报告可能包含敏感内容。' if payload['privacy'] == 'detailed' else '统计模式不提取对话正文、工具参数、输出或工作目录。')}
+成本为估算，不等同账单。当前占用是最后一次有记录的请求读数或近似值，不保证等于实时窗口。
+<p style="margin-bottom:4px"><strong>本报告的限制</strong>（无法可靠还原的数据不编造）：</p>
 <ul>{gaps}</ul>
 </div>
-</div></body></html>
+</div>{_DETAIL_SCRIPT if payload['privacy'] == 'detailed' else ''}</body></html>
 """
 
 
@@ -953,7 +1081,7 @@ def render_markdown(payload: dict) -> str:
         f"- 生成时间：{payload['generated_at']}",
         f"- 数据源：`{payload['codex_home']}/sessions`",
         f"- 会话数：{payload['session_count']}（{payload['turns_total']} 轮）",
-        f"- 计费 Token：{totals['total']:,}（输入 {totals['input']:,} / 输出 {totals['output']:,}）",
+        (f"- 计费 Token：{totals['total']:,}（输入 {totals['input']:,} / 输出 {totals['output']:,}）" if payload['usage_available'] else "- 计费 Token：未知"),
         f"- 预估成本：{human_usd(payload['cost_usd'])}",
         f"- 缓存命中率：{f'{cache * 100:.1f}%' if cache is not None else '—'}",
         f"- 工具调用：{payload['tool_calls_total']} 次",
@@ -965,8 +1093,7 @@ def render_markdown(payload: dict) -> str:
         lines.extend(
             [
                 f"- 轮次耗时合计：{human_duration(tm['turn_total'])}"
-                f"（模型 {human_duration(split['model'])}"
-                f" / 工具 {human_duration(split['tools'])}）",
+                f"（工具各次耗时之和 {human_duration(tm['tool_total'])}，可能重叠）",
                 f"- 平均每轮：{human_duration(tm['avg_turn'])}"
                 f" · 平均每工具：{human_duration(tm['avg_tool'])}",
             ]
@@ -985,13 +1112,13 @@ def render_markdown(payload: dict) -> str:
         lines.append(
             f"| `{(row['session_id'] or '—')[:8]}` | {row['started_text']} | "
             f"{row['model'] or '—'} | {row['turns']} | {row['requests']} | "
-            f"{row['tokens']['total']:,} | {human_usd(row['cost_usd'])} | "
+            f"{format(row['tokens']['total'], ',') if row['usage_available'] else '—'} | {human_usd(row['cost_usd'])} | "
             f"{human_int(row['peak_context']) if row['peak_context'] else '—'} / {window} | "
             f"{row['compactions'] or '—'} |"
         )
     lines.append("")
     lines.append(f"---")
-    lines.append(f"作者：{AUTHOR} · 仅读取会话元数据，不读对话正文")
+    lines.append(f"作者：{AUTHOR} · " + ("更详细分析：报告可能含敏感数据" if payload['privacy'] == 'detailed' else "统计模式：不提取对话正文、工具参数与输出"))
     lines.append("")
     return "\n".join(lines)
 
@@ -1001,9 +1128,63 @@ def render_markdown(payload: dict) -> str:
 # --------------------------------------------------------------------------
 
 
+CONSENT_MESSAGE = (
+    "更详细分析将读取所选 Codex 会话中保存的消息正文、命令及参数、工具输出、文件路径和 Agent 协作内容。\n"
+    "生成的本地报告可能包含密码或其他敏感数据；请仅保存在私密位置，不要随意分享。\n"
+    "本工具不联网、不上传。授权仅对本次生成有效，自动钩子仍为统计模式。\n"
+    "确认仅本次读取并生成详细报告吗？"
+)
+
+
+def request_detailed_consent(scope: str = '') -> bool:
+    """Require an interactive human decision; flags, environment and pipes cannot grant it."""
+    message = CONSENT_MESSAGE + ('\n\n' + scope if scope else '')
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            return bool(messagebox.askyesno('更详细分析 · 本次授权', message, parent=root, default='no'))
+        finally:
+            root.destroy()
+    except Exception:
+        # A real terminal is a fallback, not a pipe from an automated caller.
+        if not sys.stdin.isatty() or not sys.stderr.isatty():
+            print('无法显示授权窗口且没有交互终端；已安全取消详细分析。', file=sys.stderr)
+            return False
+        print(message, file=sys.stderr)
+        try:
+            return input('仅本次同意请输入 YES，其他输入取消：').strip() == 'YES'
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+
+def write_private(path: Path, content: str) -> None:
+    """Atomically replace the chosen output with a private temporary file.
+
+    POSIX mode is 0600; Windows uses the destination directory's ACL. No input
+    path or user data is copied elsewhere.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix='.codex-context-', dir=str(path.parent))
+    try:
+        if os.name == 'posix':
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            fd = -1
+            handle.write(content)
+        os.replace(temp_name, path)
+    finally:
+        if fd != -1:
+            os.close(fd)
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Report Codex session token and context usage (metadata only)."
+        description="本地 Codex 报告；默认仅统计，详细分析需要本次人工授权。"
     )
     parser.add_argument("--limit", type=int, default=30,
                         help="how many recent sessions (default 30, 0 = all)")
@@ -1013,29 +1194,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--md", dest="md_out", default=None, help="also write Markdown")
     parser.add_argument("--stdout", choices=("html", "json", "md", "summary"),
                         default="summary", help="print to stdout")
+    parser.add_argument("--detailed", action="store_true", help="更详细分析：每次需人工确认，仅写入指定的本地文件")
     args = parser.parse_args(argv)
-
+    if args.limit < 0:
+        parser.error('--limit must be nonnegative')
     home = codex_home(args.codex_home)
+    if args.detailed:
+        if not (args.out or args.json_out):
+            parser.error('--detailed requires --out or --json for a local report')
+        if args.stdout != 'summary':
+            parser.error('--detailed cannot print report contents to stdout')
+        range_text = '全部会话' if args.limit == 0 else f'最近 {args.limit} 个会话'
+        outputs = '、'.join(str(Path(p).expanduser()) for p in (args.out, args.json_out, args.md_out) if p)
+        scope = f'来源：{home / "sessions"}（{range_text}）\n输出：{outputs}\n同名输出文件将被替换。'
+        if not request_detailed_consent(scope):
+            print('已取消；没有读取详细会话内容。', file=sys.stderr)
+            return 2
+
     limit = None if args.limit == 0 else args.limit
-    sessions = load_sessions(home, limit=limit)
-    payload = build_payload(aggregate(sessions), home)
+    sessions = load_sessions(home, limit=limit, detailed=args.detailed)
+    payload = build_payload(aggregate(sessions), home, detailed=args.detailed)
+    destinations = [Path(p).expanduser().resolve() for p in (args.out, args.json_out, args.md_out) if p]
+    source_paths = {s.path.resolve() for s in sessions}
+    protected_roots = [(home / name).resolve() for name in ('sessions', 'archived_sessions')]
+    if (len(set(destinations)) != len(destinations)
+            or any(p in source_paths or any(p.is_relative_to(root) for root in protected_roots) for p in destinations)):
+        parser.error('输出路径必须各不相同，且不能位于会话数据目录内')
 
     if args.out:
         out = Path(args.out).expanduser()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_html(payload), encoding="utf-8")
+        write_private(out, render_html(payload))
         print(f"HTML 报告: {out}", file=sys.stderr)
 
     if args.json_out:
         out = Path(args.json_out).expanduser()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_private(out, json.dumps(payload, ensure_ascii=False, indent=2))
         print(f"JSON: {out}", file=sys.stderr)
 
     if args.md_out:
         out = Path(args.md_out).expanduser()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_markdown(payload), encoding="utf-8")
+        write_private(out, render_markdown(payload))
         print(f"Markdown: {out}", file=sys.stderr)
 
     if args.stdout == "html":
@@ -1048,7 +1246,10 @@ def main(argv: list[str] | None = None) -> int:
         totals = payload["totals"]
         cache = payload["cache_hit_rate"]
         print(f"Codex 会话数: {payload['session_count']}（{payload['turns_total']} 轮）")
-        print(f"计费 Token : {totals['total']:,} (输入 {totals['input']:,} / 输出 {totals['output']:,})")
+        if payload['usage_available']:
+            print(f"计费 Token : {totals['total']:,} (输入 {totals['input']:,} / 输出 {totals['output']:,})")
+        else:
+            print('计费 Token : 未知')
         print(f"预估成本   : {human_usd(payload['cost_usd'])}"
               + (f"（{payload['unpriced_sessions']} 个会话模型未知，未计价）"
                  if payload['unpriced_sessions'] else ""))
@@ -1064,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
             split = tm["model_vs_tool"]
             print(
                 f"耗时       : 轮次合计 {human_duration(tm['turn_total'])}"
-                f"（模型 {human_duration(split['model'])} / 工具 {human_duration(split['tools'])}）"
+                f"（工具各次耗时之和 {human_duration(tm['tool_total'])}，可能重叠）"
             )
             if tm["avg_turn"] is not None:
                 print(

@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-context-insight",
-  "version": "0.1.0",
-  "description": "上下文洞察：看 Codex 每次会话烧了多少 token、上下文窗口占了多少、成本多少。只读元数据，不外传、不联网。",
+  "version": "0.2.0",
+  "description": "Codex 本地上下文报告：默认统计模式；更详细分析须每次明确授权。报告工具不联网、不上传。", 
   "author": {
     "name": "凪梦尘"
   },
@@ -22,7 +22,7 @@
       "interface": {
         "displayName": "上下文洞察",
         "shortDescription": "看每次 Codex 会话的 token 用量、上下文占用与成本",
-        "longDescription": "以 DeepSeek Harness 的 dsh-context 为蓝本，为 Codex 补齐上下文可见性：读取 Codex 自己写下的会话元数据，生成一张离线 HTML 报告，含 KPI、按日用量、模型分布、工具调用与会话明细。只读元数据（token 数、模型名、工具名、时间戳），不读提示词正文、回答、工具参数或输出，不联网、不上传。",
+        "longDescription": "本地离线报告默认只统计元数据；更详细分析每次都要由用户确认，报告可能包含敏感数据。提供实验性 MCP 统计面板，桌面兼容性取决于 Codex 版本。报告工具不联网、不上传。", 
         "developerName": "凪梦尘",
         "category": "Productivity",
         "capabilities": ["Read"],

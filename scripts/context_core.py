@@ -3,9 +3,8 @@
 
 Design constraints (user decisions, 2026-11-14):
   * Pure Python, no third-party dependencies, no network.
-  * Metadata only: never stores prompt text, assistant text, tool arguments or
-    tool output. Only counts, model names, token figures, tool names, command
-    program names and timestamps are extracted.
+  * Metadata-only by default. Explicit, per-run user consent is required before
+    the optional detailed collector accesses message text, paths or tool data.
 
 Codex writes one JSONL file per session at
 ``$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`` (CODEX_HOME defaults to
@@ -20,6 +19,7 @@ Two views are kept, because Codex records both:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -149,13 +149,14 @@ class TurnTiming:
     started_at: float | None = None
     completed_at: float | None = None
     duration_ms: int = 0
+    time_to_first_token_ms: int | None = None
 
     @property
     def duration(self) -> float | None:
         if self.duration_ms:
             return self.duration_ms / 1000.0
-        if self.started_at is not None and self.completed_at is not None:
-            return max(0.0, self.completed_at - self.started_at)
+        if self.started_at is not None and self.completed_at is not None and self.completed_at >= self.started_at:
+            return self.completed_at - self.started_at
         return None
 
 
@@ -172,9 +173,9 @@ class ToolTiming:
     @property
     def duration(self) -> float | None:
         if self.started_at_ms and self.completed_at_ms:
-            return max(0.0, (self.completed_at_ms - self.started_at_ms) / 1000.0)
-        if self.started_at is not None and self.completed_at is not None:
-            return max(0.0, self.completed_at - self.started_at)
+            return ((self.completed_at_ms - self.started_at_ms) / 1000.0) if self.completed_at_ms >= self.started_at_ms else None
+        if self.started_at is not None and self.completed_at is not None and self.completed_at >= self.started_at:
+            return self.completed_at - self.started_at
         return None
 
 
@@ -285,6 +286,8 @@ class Session:
     compaction_count: int = 0
     rate_limit_events: list[dict[str, Any]] = field(default_factory=list)
     unknown_lines: dict[str, int] = field(default_factory=dict)
+    # None in the default privacy mode; populated only after explicit consent.
+    details: dict[str, Any] | None = None
 
     # ---- derived -------------------------------------------------------
     @property
@@ -409,6 +412,16 @@ class Session:
         """Per-request deltas, for the growth chart."""
         return [(d.timestamp, d) for d in self.deltas]
 
+    def context_changes(self) -> list[dict[str, Any]]:
+        """Difference between successive recorded context readings, not causal attribution."""
+        previous = None
+        rows = []
+        for timestamp, used, window in self.context_series():
+            rows.append({"timestamp": timestamp, "used": used, "window": window,
+                         "change": None if previous is None else used - previous})
+            previous = used
+        return rows
+
 
 # --------------------------------------------------------------------------
 # Discovery
@@ -452,11 +465,12 @@ def _as_int(value: Any) -> int:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value)
+        return int(value) if math.isfinite(value) else 0
     if isinstance(value, str):
         try:
-            return int(float(value))
-        except ValueError:
+            number = float(value)
+            return int(number) if math.isfinite(number) else 0
+        except (ValueError, OverflowError):
             return 0
     return 0
 
@@ -465,11 +479,16 @@ def _as_float(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and abs(number) < 253402300000 else None
+        except OverflowError:
+            return None
     if isinstance(value, str):
         try:
-            return float(value)
-        except ValueError:
+            number = float(value)
+            return number if math.isfinite(number) and abs(number) < 253402300000 else None
+        except (ValueError, OverflowError):
             pass
         try:
             return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
@@ -665,13 +684,176 @@ def _item_kind(payload: dict[str, Any]) -> tuple[str, str | None]:
 
 
 # --------------------------------------------------------------------------
+# Optional detailed collection. This is never instantiated in metadata mode.
+# It is intentionally conservative: records are observations, not a rebuilt
+# model context or proof that an agent/process is still running.
+# --------------------------------------------------------------------------
+
+_DETAIL_ITEMS = 1000
+_DETAIL_CHARS = 4000
+
+
+def _detail_text(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    elif value is None:
+        return ""
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return ""
+    return text[:_DETAIL_CHARS] + ("\n…[内容已截断]" if len(text) > _DETAIL_CHARS else "")
+
+
+class DetailCollector:
+    """Collect bounded evidence from explicitly authorized local rollouts."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, Any] = {
+            "records": [], "commands": [], "files": [], "events": [],
+            "collaboration": [], "parent_thread_id": None, "truncated": False,
+        }
+        self._legacy_commands: list[dict[str, Any]] = []
+        self._open_commands: dict[str, dict[str, Any]] = {}
+        self._step = 0
+        self._turn = 0
+
+    def _add(self, bucket: str, row: dict[str, Any]) -> None:
+        rows = self.data[bucket]
+        if len(rows) >= _DETAIL_ITEMS:
+            self.data["truncated"] = True
+            return
+        row.update({"step": self._step, "turn": self._turn})
+        rows.append(row)
+
+    def accept(self, kind: Any, payload: dict[str, Any], when: float | None) -> None:
+        ptype = payload.get("type")
+        if kind == "session_meta":
+            parent = payload.get("parent_thread_id")
+            if isinstance(parent, str):
+                self.data["parent_thread_id"] = _detail_text(parent)
+        if ptype in ("turn_started", "task_started"):
+            self._turn += 1
+        if ptype == "token_count" or kind == "token_usage_record":
+            self._step += 1
+        if kind == "compacted" or ptype in ("context_compacted", "compaction", "compact"):
+            self._add("events", {"time": when, "kind": str(kind if kind == "compacted" else ptype)})
+        if kind == "inter_agent_communication":
+            self._add("collaboration", {
+                "time": when, "kind": "message", "sender": _detail_text(payload.get("author")),
+                "recipients": _detail_text([payload.get("recipient")] + (payload.get("other_recipients") if isinstance(payload.get("other_recipients"), list) else [])),
+                "content": _detail_text(payload.get("content")), "status": "已记录，非实时状态",
+            })
+        if kind == "response_item":
+            self._response(payload, when)
+        if ptype == "item_completed":
+            item = payload.get("item")
+            if isinstance(item, dict):
+                self._completed(item, payload, when)
+
+    def _response(self, payload: dict[str, Any], when: float | None) -> None:
+        kind = payload.get("type")
+        if not isinstance(kind, str):
+            return
+        if kind == "message" or kind == "agent_message":
+            role = payload.get("role") if kind == "message" else "assistant"
+            content = payload.get("content")
+            parts = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+            self._add("records", {"time": when, "kind": _detail_text(role or "message"), "content": _detail_text("\n".join(parts))})
+        elif kind in TOOL_CALL_TYPES:
+            name = payload.get("name") or kind
+            arg = payload.get("arguments") if kind == "function_call" else payload.get("input")
+            if kind == "local_shell_call":
+                arg = payload.get("action")
+            self._add("records", {"time": when, "kind": "工具调用 · " + _detail_text(name), "content": _detail_text(arg)})
+            if name in ("shell", "exec_command", "shell_command", "local_shell") or kind == "local_shell_call":
+                command = {"time": when, "command": _detail_text(arg), "status": "未知", "exit_code": None,
+                           "duration": None, "output": "", "source": "response_item"}
+                if len(self._legacy_commands) < _DETAIL_ITEMS:
+                    self._legacy_commands.append(command)
+                    call_id = payload.get("call_id")
+                    if isinstance(call_id, str):
+                        self._open_commands[call_id] = command
+                else:
+                    self.data["truncated"] = True
+            if name == "apply_patch":
+                patch = payload.get("input")
+                if isinstance(patch, str):
+                    for match in re.finditer(r"^\*\*\* (Add|Update|Delete) File: (.+)$", patch, re.MULTILINE):
+                        self._add("files", {"time": when, "kind": "write", "path": _detail_text(match.group(2)), "source": "apply_patch 调用（未证明成功）"})
+        elif kind in TOOL_OUTPUT_TYPES:
+            output = payload.get("output")
+            self._add("records", {"time": when, "kind": "工具结果", "content": _detail_text(output)})
+            call_id = payload.get("call_id")
+            cmd = self._open_commands.pop(call_id, None) if isinstance(call_id, str) else None
+            if cmd is not None:
+                cmd["output"] = _detail_text(output)
+                # Raw tool output is not a reliable exit status.
+
+    def _completed(self, item: dict[str, Any], envelope: dict[str, Any], when: float | None) -> None:
+        kind = item.get("type")
+        if kind == "CommandExecution":
+            start_ms = _payload_time_ms(envelope, "started_at_ms")
+            end_ms = _payload_time_ms(envelope, "completed_at_ms")
+            duration = (end_ms - start_ms) / 1000 if start_ms and end_ms >= start_ms else None
+            exit_code = item.get("exit_code")
+            if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+                exit_code = None
+            raw_command = item.get("command")
+            program = raw_command[0] if isinstance(raw_command, list) and raw_command and isinstance(raw_command[0], str) else None
+            self._add("commands", {"time": when, "command": _detail_text(raw_command), "program": _detail_text(program),
+                "status": _detail_text(item.get("status")) or "未知", "exit_code": exit_code,
+                "duration": duration, "output": _detail_text(item.get("aggregated_output")),
+                "source": "item_completed.CommandExecution"})
+            parsed = item.get("parsed_cmd")
+            if isinstance(parsed, list):
+                for part in parsed:
+                    if isinstance(part, dict) and part.get("type") in ("read", "search", "list_files") and isinstance(part.get("path"), str):
+                        self._add("files", {"time": when, "kind": "read" if part["type"] == "read" else "search", "path": _detail_text(part["path"]), "source": "parsed_cmd（尽力识别）"})
+        elif kind == "FileChange":
+            changes = item.get("changes")
+            if isinstance(changes, dict):
+                for path in changes:
+                    if isinstance(path, str):
+                        self._add("files", {"time": when, "kind": "write", "path": _detail_text(path), "source": "item_completed.FileChange · " + _detail_text(item.get("status") or "状态未知")})
+        elif kind == "ImageView" and isinstance(item.get("path"), str):
+            self._add("files", {"time": when, "kind": "image", "path": _detail_text(item["path"]), "source": "item_completed.ImageView"})
+        elif kind == "ContextCompaction":
+            self._add("events", {"time": when, "kind": "item_completed.ContextCompaction"})
+        elif kind == "CollabAgentToolCall":
+            self._add("collaboration", {"time": when, "kind": _detail_text(item.get("tool")),
+                "sender": _detail_text(item.get("sender_thread_id")),
+                "recipients": _detail_text(item.get("receiver_thread_ids")),
+                "content": _detail_text(item.get("prompt")), "status": _detail_text(item.get("status"))})
+        elif kind == "SubAgentActivity":
+            self._add("collaboration", {"time": when, "kind": _detail_text(item.get("kind")),
+                "sender": "", "recipients": _detail_text(item.get("agent_thread_id")),
+                "content": "", "status": "历史事件，非实时状态"})
+
+    def finish(self) -> dict[str, Any]:
+        # Avoid double-counting raw response calls when richer command items exist.
+        # Mixed old/new sessions may consequently omit legacy-only calls.
+        if not self.data["commands"]:
+            self.data["commands"] = self._legacy_commands
+        return self.data
+
+
+# --------------------------------------------------------------------------
 # Parsing
 # --------------------------------------------------------------------------
 
 
-def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
-    """Parse one rollout JSONL file. Never raises on malformed input."""
+def parse_rollout(path: Path, *, max_lines: int | None = None, detailed: bool = False) -> Session:
+    """Parse a rollout; detailed access is an explicit caller responsibility."""
     session = Session(path=path, session_id=session_id_from_path(path))
+    collector = DetailCollector() if detailed else None
     first_time: float | None = None
     last_time: float | None = None
 
@@ -679,6 +861,10 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
     open_turn: TurnTiming | None = None
     open_tools: dict[str, ToolTiming] = {}
     anonymous_tools: list[ToolTiming] = []
+    record_snapshots: list[Usage] = []
+    record_deltas: list[Usage] = []
+    compacted_records = 0
+    compacted_items = 0
 
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
@@ -713,15 +899,18 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
             payload = obj.get("payload")
             if not isinstance(payload, dict):
                 payload = obj
+            if collector is not None:
+                collector.accept(top_type, payload, when)
 
             # --- session metadata ------------------------------------
             if top_type in ("session_meta", "session_start", "session_configured"):
                 sid = payload.get("id") or payload.get("session_id")
                 if isinstance(sid, str) and sid:
                     session.session_id = sid
-                cwd = payload.get("cwd")
-                if isinstance(cwd, str) and cwd:
-                    session.cwd = cwd
+                if detailed:
+                    cwd = payload.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        session.cwd = cwd
                 version = payload.get("cli_version")
                 if isinstance(version, str) and version:
                     session.cli_version = version
@@ -734,9 +923,10 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
                 continue
 
             if top_type == "turn_context":
-                cwd = payload.get("cwd")
-                if isinstance(cwd, str) and cwd:
-                    session.cwd = cwd
+                if detailed:
+                    cwd = payload.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        session.cwd = cwd
                 model = payload.get("model")
                 if isinstance(model, str) and model:
                     session.models[model] = session.models.get(model, 0) + 1
@@ -754,20 +944,30 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
                     session.snapshots.append(snapshot)
                 if delta is not None:
                     session.deltas.append(delta)
-                limits = payload.get("rate_limits")
-                if isinstance(limits, dict) and limits:
-                    session.rate_limit_events.append(limits)
+                # Do not retain the unbounded rate_limits object: providers may
+                # add fields that are not metadata or are sensitive.
                 continue
 
             if top_type == "token_usage_record":
-                snapshot, delta = _parse_token_count(payload, when)
-                model = payload.get("model") or payload.get("model_slug")
-                if isinstance(model, str) and model:
-                    session.models[model] = session.models.get(model, 0) + 1
+                # Newer canonical records carry usage/thread_token_usage. They
+                # overlap token_count events, so use them only as a fallback.
+                owner = payload.get("thread_id")
+                if isinstance(owner, str) and session.session_id and owner != session.session_id:
+                    continue
+                info = {"total_token_usage": payload.get("thread_token_usage"),
+                        "last_token_usage": payload.get("usage")}
+                snapshot, delta = _parse_token_count({"info": info}, when)
                 if snapshot is not None:
-                    session.snapshots.append(snapshot)
+                    record_snapshots.append(snapshot)
                 if delta is not None:
-                    session.deltas.append(delta)
+                    record_deltas.append(delta)
+                continue
+
+            # A compacted marker and a legacy event may describe the same
+            # compaction. Count each representation separately, then use the
+            # largest observed count as a conservative lower bound.
+            if top_type == "compacted":
+                compacted_records += 1
                 continue
 
             # --- turn boundaries --------------------------------------
@@ -788,6 +988,9 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
                 open_turn.completed_at = completed
                 if duration_ms:
                     open_turn.duration_ms = duration_ms
+                ttfb = payload.get("time_to_first_token_ms")
+                if isinstance(ttfb, int) and not isinstance(ttfb, bool) and ttfb >= 0:
+                    open_turn.time_to_first_token_ms = ttfb
                 open_turn = None
                 continue
             if payload_type in ("user_message", "user_prompt"):
@@ -833,8 +1036,8 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
                     entry = None
                     if isinstance(call_id, str) and call_id:
                         entry = open_tools.pop(call_id, None)
-                    if entry is None and anonymous_tools:
-                        entry = anonymous_tools.pop(0)
+                    # Without a matching call_id, concurrent calls cannot be
+                    # paired reliably; leave their durations unknown.
                     if entry is not None:
                         entry.completed_at = finished
                         if finished_ms:
@@ -852,20 +1055,32 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
             # Codex also emits item_completed events carrying item metadata and
             # millisecond stamps; use them to finish an unpaired tool call.
             if payload_type == "item_completed":
-                finished_ms = _payload_time_ms(
-                    payload, "completed_at_ms", "ended_at_ms", "started_at_ms"
-                )
-                if finished_ms and anonymous_tools:
-                    entry = anonymous_tools.pop(0)
-                    if entry.completed_at is None:
-                        entry.completed_at_ms = finished_ms
-                        entry.completed_at = finished_ms / 1000.0
+                # Only pair an item by an explicit ID; unrelated item events
+                # must never complete an anonymous tool or use a start as end.
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get('type') == 'ContextCompaction':
+                    compacted_items += 1
+                item_id = item.get("id") if isinstance(item, dict) else None
+                finished_ms = _payload_time_ms(payload, "completed_at_ms", "ended_at_ms")
+                entry = open_tools.pop(item_id, None) if isinstance(item_id, str) else None
+                if entry is not None and finished_ms:
+                    entry.completed_at_ms = finished_ms
+                    entry.completed_at = finished_ms / 1000.0
                 continue
 
             # --- anything else ----------------------------------------
-            key = str(payload_type or top_type or "unknown")
+            candidate = payload_type or top_type
+            # Unknown type metadata must be a small snake-case identifier, not
+            # an arbitrary JSON object or text containing private content.
+            key = candidate if isinstance(candidate, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', candidate) else 'unknown'
             session.unknown_lines[key] = session.unknown_lines.get(key, 0) + 1
 
+    session.compaction_count = max(session.compaction_count, compacted_records, compacted_items)
+    if not session.snapshots and not session.deltas:
+        session.snapshots = record_snapshots
+        session.deltas = record_deltas
+    if collector is not None:
+        session.details = collector.finish()
     session.started_at = session.started_at or first_time
     session.ended_at = last_time or session.started_at
     if session.turn_count == 0 and session.items.user_messages:
@@ -874,13 +1089,13 @@ def parse_rollout(path: Path, *, max_lines: int | None = None) -> Session:
 
 
 def load_sessions(
-    home: Path | None = None, *, limit: int | None = None
+    home: Path | None = None, *, limit: int | None = None, detailed: bool = False
 ) -> list[Session]:
     """Parse the newest ``limit`` rollouts (all when limit is None)."""
     files = find_rollouts(home)
     if limit is not None:
         files = files[:limit]
-    sessions = [parse_rollout(p) for p in files]
+    sessions = [parse_rollout(p, detailed=detailed) for p in files]
     sessions.sort(key=lambda s: s.started_at or 0, reverse=True)
     return sessions
 
@@ -1050,7 +1265,10 @@ class Aggregate:
         for s in self.sessions:
             if s.started_at is None:
                 continue
-            day = datetime.fromtimestamp(s.started_at).strftime("%Y-%m-%d")
+            try:
+                day = datetime.fromtimestamp(s.started_at).strftime("%Y-%m-%d")
+            except (ValueError, OverflowError, OSError):
+                continue
             bucket = buckets.setdefault(
                 day, {"tokens": 0.0, "cost": 0.0, "sessions": 0.0, "turns": 0.0}
             )
