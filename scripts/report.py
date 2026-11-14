@@ -513,7 +513,9 @@ def build_payload(agg: Aggregate, home: Path, *, detailed: bool = False) -> dict
             "avg_tool": agg.avg_tool_seconds,
             "timed_turns": agg.timed_turns,
             "timed_tools": agg.timed_tools,
-            "first_token_ms": [t.time_to_first_token_ms for s in agg.sessions for t in s.timing.turns if t.time_to_first_token_ms is not None],
+            "first_token_ms": agg.first_token_times_ms,
+            "avg_first_token_ms": agg.avg_first_token_ms,
+            "timed_first_tokens": agg.timed_first_tokens,
             "by_tool": agg.tool_timing(),
             "slowest": [
                 {
@@ -717,7 +719,7 @@ def _timing_card(payload: dict) -> str:
     tool_total = timing["tool_total"]
     split = timing["model_vs_tool"]
 
-    if turn_total <= 0 and tool_total <= 0:
+    if not timing['timed_turns'] and not timing['timed_tools'] and not timing['timed_first_tokens']:
         return (
             '<div class="card"><h2>耗时统计</h2>'
             '<div class="empty">这批会话没有可用的时间记录。</div></div>'
@@ -774,8 +776,8 @@ def _timing_card(payload: dict) -> str:
         for label, value, note in stats
     )
 
-    first = timing['first_token_ms']
-    first_note = f"首 token 平均 {sum(first) / len(first):.0f}ms（{len(first)} 轮有记录）" if first else "首 token 耗时：未知"
+    first = timing['avg_first_token_ms']
+    first_note = f"首 token 平均 {first:.0f}ms（{timing['timed_first_tokens']} 轮有记录）" if first is not None else "首 token 耗时：未知"
     note = (
         "轮次耗时为单轮墙钟时间；工具耗时为调用到配对结果的时间，各次可以并发重叠。"
         "工具耗时之和不能从轮次总耗时相减得出模型耗时；无可靠拆分时不显示。" + first_note

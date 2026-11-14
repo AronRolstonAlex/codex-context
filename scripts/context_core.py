@@ -1193,6 +1193,20 @@ class Aggregate:
         return sum(values) / len(values) if values else None
 
     @property
+    def first_token_times_ms(self) -> list[int]:
+        return [t.time_to_first_token_ms for s in self.sessions for t in s.timing.turns
+                if t.time_to_first_token_ms is not None]
+
+    @property
+    def timed_first_tokens(self) -> int:
+        return len(self.first_token_times_ms)
+
+    @property
+    def avg_first_token_ms(self) -> float | None:
+        values = self.first_token_times_ms
+        return sum(values) / len(values) if values else None
+
+    @property
     def avg_tool_seconds(self) -> float | None:
         values = [
             t.duration
