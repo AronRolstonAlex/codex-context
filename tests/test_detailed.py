@@ -94,6 +94,22 @@ class TestDetailed(unittest.TestCase):
             self.assertEqual(session.timing.turns[0].time_to_first_token_ms, 230)
             self.assertEqual(session.context_changes()[-1]['change'], 100)
 
+    def test_detail_summary_is_computed_in_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            session = core.parse_rollout(fixture(home), detailed=True)
+            aggregate = core.aggregate([session])
+            summary = aggregate.detail_summary()
+            self.assertEqual((summary['commands'], summary['failed'], summary['slow'], summary['messages']), (1, 1, 1, 1))
+            self.assertEqual(summary['programs'], [{'name': 'echo', 'count': 1}])
+            self.assertTrue(any(row['kind'] == 'write' and row['count'] == 1 for row in summary['files']))
+            payload = report.build_payload(aggregate, home, detailed=True)
+            self.assertEqual(payload['detail_summary'], summary)
+            page = report.render_html(payload)
+            self.assertIn('已记录 1 条，已知失败 1 条，已知慢 1 条', page)
+            self.assertIn('data-tags="失败 慢"', page)
+            self.assertNotIn(ATTACK, page)
+
     def test_unknown_event_object_never_leaks_private_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'rollout-malformed.jsonl'

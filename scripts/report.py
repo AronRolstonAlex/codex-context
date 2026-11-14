@@ -530,6 +530,7 @@ def build_payload(agg: Aggregate, home: Path, *, detailed: bool = False) -> dict
         "duration_total": agg.duration_total,
         "sessions": sessions_payload,
         "privacy": "detailed" if detailed else "metadata_only",
+        "detail_summary": agg.detail_summary() if detailed else None,
         "data_gaps": DATA_GAPS,
     }
 
@@ -797,9 +798,9 @@ def _detail_panel(payload: dict) -> str:
         return ''
     groups: dict[str, list[str]] = {"records": [], "events": [], "files": [], "commands": [], "fleet": []}
     notes = []
-    file_counts: dict[tuple[str, str], int] = {}
-    program_counts: dict[str, int] = {}
-    observed_commands = observed_failed = observed_slow = observed_messages = 0
+    summary = payload.get('detail_summary') or {}
+    file_labels = {'read': '读取', 'write': '写入', 'search': '搜索', 'image': '图片'}
+    tag_labels = {'failed': '失败', 'slow': '慢', 'background': '后台'}
     for session in payload['sessions']:
         detail = session.get('details') or {}
         sid = str(session.get('session_id') or '未知')[:12]
@@ -814,33 +815,17 @@ def _detail_panel(payload: dict) -> str:
         for row in detail.get('events', []):
             groups['events'].append(f'<div class="filter-row" data-tags="压缩">{esc(sid)} · {esc(fmt_time(row.get("time")))} · {esc(row.get("kind"))}</div>')
         for row in detail.get('files', []):
-            tags = {'read': '读取', 'write': '写入', 'search': '搜索', 'image': '图片'}.get(row.get('kind'), '未知')
-            key = (tags, str(row.get('path') or '未知'))
-            file_counts[key] = file_counts.get(key, 0) + 1
+            tags = file_labels.get(row.get('kind'), '未知')
             groups['files'].append(f'<div class="filter-row" data-tags="{tags}"><b>{tags}</b> · {esc(sid)} · {esc(fmt_time(row.get("time")))} · <span class="mono">{esc(row.get("path"))}</span> <span class="muted">{esc(row.get("source"))}</span></div>')
         for row in detail.get('commands', []):
-            observed_commands += 1
-            program = row.get('program')
-            if program:
-                program_counts[program] = program_counts.get(program, 0) + 1
             status = str(row.get('status') or '未知')
             code = row.get('exit_code')
             duration = row.get('duration')
-            tags = []
-            if status.lower() == 'failed' or (isinstance(code, int) and code != 0):
-                tags.append('失败')
-                observed_failed += 1
-            if isinstance(duration, (int, float)) and duration >= 10:
-                tags.append('慢')
-                observed_slow += 1
-            if status.lower() in ('in_progress', 'inprogress'):
-                tags.append('后台')
+            tags = [tag_labels[tag] for tag in row.get('tags', []) if tag in tag_labels]
             title = f"{sid} · {fmt_time(row.get('time'))} · {status} · 退出码 {code if code is not None else '未知'} · {human_duration(duration)}"
             body = f"命令：\n{row.get('command', '')}\n\n输出（可能已截断）：\n{row.get('output', '')}"
             groups['commands'].append(f'<details class="filter-row" data-tags="{esc(" ".join(tags))}"><summary>{esc(title)}</summary><pre>{esc(body)}</pre></details>')
         for row in detail.get('collaboration', []):
-            if row.get('kind') == 'message':
-                observed_messages += 1
             title = f"{sid} · {fmt_time(row.get('time'))} · {row.get('kind', '事件')} · {row.get('status', '未知')}"
             body = f"发送方：{row.get('sender', '')}\n接收方：{row.get('recipients', '')}\n\n{row.get('content', '')}"
             groups['fleet'].append(f'<details class="filter-row" data-tags="事件"><summary>{esc(title)}</summary><pre>{esc(body)}</pre></details>')
@@ -852,8 +837,8 @@ def _detail_panel(payload: dict) -> str:
                 f'<div class="controls"><label>筛选 <select data-filter="{key}"><option value="">全部</option>{options}</select></label>'
                 f'<label>搜索 <input type="search" data-search="{key}" placeholder="在已加载的记录中搜索"></label></div>'
                 f'<div class="rows">{rows}</div></section>')
-    file_summary = '；'.join(f'{kind} {path} ×{count}' for (kind, path), count in sorted(file_counts.items(), key=lambda item: -item[1])[:20]) or '没有可汇总的路径'
-    program_summary = '；'.join(f'{name} ×{count}' for name, count in sorted(program_counts.items(), key=lambda item: -item[1])[:12]) or '程序分布未知'
+    file_summary = '；'.join(f"{file_labels.get(row['kind'], '未知')} {row['path']} ×{row['count']}" for row in summary.get('files', [])) or '没有可汇总的路径'
+    program_summary = '；'.join(f"{row['name']} ×{row['count']}" for row in summary.get('programs', [])) or '程序分布未知'
     warning = '<div class="warning">更详细分析：此报告可能包含提示词、回答、命令、输出、文件路径及协作消息中的敏感数据。请仅保存在私密位置，不要随意分享。</div>'
     if notes:
         warning += '<p class="warning">' + esc('；'.join(notes)) + '</p>'
@@ -861,8 +846,8 @@ def _detail_panel(payload: dict) -> str:
         + panel('records', '记录浏览器', ['user', 'assistant', '工具调用', '工具结果'], '展示已保存条目，不是任一请求完整上下文；历史可能包含继承内容。')
         + panel('events', '上下文事件', ['压缩'], '仅列可识别的压缩记录；不同记录可能描述同一次操作，不能直接当作去重次数。')
         + panel('files', '文件活动', ['读取', '写入', '搜索', '图片'], '来自结构化命令解析、文件变更及图片条目；不是完整文件审计，调用不等于成功。路径频次（最多 20 项）：' + file_summary)
-        + panel('commands', '命令执行', ['失败', '慢', '后台'], f'已记录 {observed_commands} 条，已知失败 {observed_failed} 条，已知慢 {observed_slow} 条；程序：{program_summary}。旧格式状态未知，慢指有时长且不少于 10 秒；后台仅显示明确记录为运行中的条目。')
-        + panel('fleet', '编队 · 已记录的协作', ['关系', '事件'], f'已记录消息 {observed_messages} 条；来自父线程字段、协作条目和 Agent 间消息，仅为历史观察，不推断实时运行状态。'))
+        + panel('commands', '命令执行', ['失败', '慢', '后台'], f"已记录 {summary.get('commands', 0)} 条，已知失败 {summary.get('failed', 0)} 条，已知慢 {summary.get('slow', 0)} 条；程序：{program_summary}。旧格式状态未知，慢指有时长且不少于 10 秒；后台仅显示明确记录为运行中的条目。")
+        + panel('fleet', '编队 · 已记录的协作', ['关系', '事件'], f"已记录消息 {summary.get('messages', 0)} 条；来自父线程字段、协作条目和 Agent 间消息，仅为历史观察，不推断实时运行状态。"))
 
 
 _DETAIL_SCRIPT = """<script>

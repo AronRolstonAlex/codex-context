@@ -842,6 +842,18 @@ class DetailCollector:
         # Mixed old/new sessions may consequently omit legacy-only calls.
         if not self.data["commands"]:
             self.data["commands"] = self._legacy_commands
+        for row in self.data["commands"]:
+            tags = []
+            status = str(row.get('status') or '').lower()
+            code = row.get('exit_code')
+            duration = row.get('duration')
+            if status == 'failed' or (isinstance(code, int) and not isinstance(code, bool) and code != 0):
+                tags.append('failed')
+            if isinstance(duration, (int, float)) and duration >= 10:
+                tags.append('slow')
+            if status in ('in_progress', 'inprogress'):
+                tags.append('background')
+            row['tags'] = tags
         return self.data
 
 
@@ -1245,6 +1257,33 @@ class Aggregate:
             for name, count in s.tool_histogram().items():
                 hist[name] = hist.get(name, 0) + count
         return dict(sorted(hist.items(), key=lambda kv: -kv[1]))
+
+    def detail_summary(self) -> dict[str, Any]:
+        """Aggregate only explicitly collected observations, not inferred facts."""
+        files: dict[tuple[str, str], int] = {}
+        programs: dict[str, int] = {}
+        commands = failed = slow = messages = 0
+        for session in self.sessions:
+            detail = session.details or {}
+            for row in detail.get('files', []):
+                key = (str(row.get('kind') or 'unknown'), str(row.get('path') or '未知'))
+                files[key] = files.get(key, 0) + 1
+            for row in detail.get('commands', []):
+                commands += 1
+                tags = row.get('tags') or []
+                failed += int('failed' in tags)
+                slow += int('slow' in tags)
+                program = row.get('program')
+                if isinstance(program, str) and program:
+                    programs[program] = programs.get(program, 0) + 1
+            messages += sum(1 for row in detail.get('collaboration', []) if row.get('kind') == 'message')
+        return {
+            'commands': commands, 'failed': failed, 'slow': slow, 'messages': messages,
+            'files': [{'kind': kind, 'path': path, 'count': count}
+                      for (kind, path), count in sorted(files.items(), key=lambda item: -item[1])[:20]],
+            'programs': [{'name': name, 'count': count}
+                         for name, count in sorted(programs.items(), key=lambda item: -item[1])[:12]],
+        }
 
     def item_counts(self) -> dict[str, int]:
         out = {
